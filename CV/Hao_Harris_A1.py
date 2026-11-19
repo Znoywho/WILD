@@ -68,7 +68,15 @@ def nms_2d(response, window=3):
             out_window = out[max(0, i-r):i+r+1, max(0, j-r):j+r+1]
             out[i, j] = response[i, j] == patch.max() and not out_window.any()
     return out
-    
+
+def drop_border_points(mask, border):
+    """Bỏ mọi điểm trong dải `border` px sát mép ảnh. -> mảng bool mới.
+    Lọc Gauss σ với tới ~3σ; trong dải đó ảnh bị phản chiếu ở mép nên sinh góc giả.
+    """
+    inside = np.zeros_like(mask)
+    inside[border:mask.shape[0] - border, border:mask.shape[1] - border] = True
+    return mask & inside
+
 def harris_classic(img, sigma_i=2.0, sigma_d=1.4, k=0.04, thresh_rel=0.01):
     """Harris một tỉ lệ: R -> nms_2d -> ngưỡng tương đối theo max(R).
     -> mảng (N, 3): (row, col, response), sắp xếp giảm dần theo response.
@@ -77,6 +85,8 @@ def harris_classic(img, sigma_i=2.0, sigma_d=1.4, k=0.04, thresh_rel=0.01):
     R = harris_response(img, sigma_i= sigma_i, sigma_d = sigma_d, k = k)
     nms = nms_2d(R)
     nms = nms & (R > thresh_rel * R.max())
+    # Đo trên 6 ảnh: điểm cách mép < 6 px giả 28-64%, xa hơn chỉ ~7% -> dải viền = ceil(3σ_I) = 6 px
+    nms = drop_border_points(nms, int(np.ceil(3 * sigma_i)))
 
     rows, cols = np.nonzero(nms)
     result = np.column_stack((rows, cols, R[rows, cols]))
@@ -134,26 +144,24 @@ def harris_laplace(img, sigmas, k=0.04, thresh_rel=0.01, log_thresh=0.0):
     # Like when you stack the layers in each image with different sigma in LoG
 
     result = []
-    for s in range(len(sigmas)):
+    
+    for s in range(1, len(sigmas) - 1):
         ys, xs = np.nonzero(corner_masks[s])
         for y, x in zip(ys, xs):
             log_val = log_stack[s, y, x]
-            is_max = True
-            if s > 0 and log_stack[s - 1, y, x] > log_val:
-                is_max = False
-            if s < len(sigmas) - 1 and log_stack[s + 1, y, x] > log_val:
-                is_max = False
+            is_max = log_val > log_stack[s - 1, y, x] and log_val > log_stack[s + 1, y, x]
             if is_max and log_val > log_thresh:
                 result.append((y, x, sigmas[s], response_maps[s][y, x]))
 
     return np.array(result).reshape(-1, 4)
 
-def is_inside_of_image(points, img):
+def is_inside_of_image(points, img, border=0):
+    """Điểm (x, y) có nằm trong ảnh, cách mép ít nhất `border` px không. -> mảng bool."""
     H, W = img[:2]
 
     x, y = points[:, 0], points[:, 1]
 
-    return (((x >= 0) & (x < W) ) & ((y >= 0) & (y < H)))
+    return (((x >= border) & (x < W - border)) & ((y >= border) & (y < H - border)))
 
 def rotate_matrix(center, angle_deg, scale=1.0):
     cx, cy = center
@@ -164,17 +172,23 @@ def rotate_matrix(center, angle_deg, scale=1.0):
         [-beta, alpha, beta * cx + (1 - alpha) * cy],
     ])
 
-def repeatability(pts_a, pts_b, transform, img_shape, eps=3.0):
+def repeatability(pts_a, pts_b, transform, img_shape, eps=3.0, border=6):
     """Tỉ lệ điểm của ảnh A tìm lại được trong ảnh B sau phép biến đổi.
     transform: hàm (row, col) của A -> (row, col) tương ứng ở B.
     Chỉ tính trên các điểm mà ảnh chiếu còn nằm trong B.
     -> số thực trong [0, 1].
+    Nhận thêm ma trận affine 2x3 theo (x, y), như cv.getRotationMatrix2D trả về.
+    border: bỏ điểm chiếu vào dải mép này của B, vì harris_classic không phát hiện ở đó
+            (mặc định 6 = ceil(3σ_I) với σ_I = 2). Đặt 0 để tính đúng như đề gốc.
     """
-    
-    P = np.column_stack((pts_a[:, 1], pts_a[:, 0], np.ones(len(pts_a))))
-    transformed_pts_a = P @ transform.T
+    if callable(transform):          # đúng mô tả của đề: transform(row, col) -> (row, col)
+        moved_rc = np.array([transform(r, c) for r, c in pts_a[:, :2]]).reshape(-1, 2)
+        transformed_pts_a = moved_rc[:, [1, 0]]          # (row, col) -> (x, y)
+    else:
+        P = np.column_stack((pts_a[:, 1], pts_a[:, 0], np.ones(len(pts_a))))
+        transformed_pts_a = P @ transform.T
 
-    isInside_a = is_inside_of_image(transformed_pts_a, img_shape)
+    isInside_a = is_inside_of_image(transformed_pts_a, img_shape, border)
     transformed_pts_a = transformed_pts_a[isInside_a]
     if len(transformed_pts_a) == 0 or len(pts_b) == 0:
         return 0.0 
